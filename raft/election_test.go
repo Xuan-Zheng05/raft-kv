@@ -17,8 +17,10 @@ const (
 var clusterSizes = []int{3, 5}
 
 func TestInitialElection(t *testing.T) {
+	t.Parallel()
 	for _, n := range clusterSizes {
 		t.Run(fmt.Sprintf("%d servers", n), func(t *testing.T) {
+			t.Parallel()
 			c := newCluster(t, n)
 			c.waitForStableLeader(firstElectionWithin)
 		})
@@ -26,8 +28,10 @@ func TestInitialElection(t *testing.T) {
 }
 
 func TestReElection(t *testing.T) {
+	t.Parallel()
 	for _, n := range clusterSizes {
 		t.Run(fmt.Sprintf("%d servers", n), func(t *testing.T) {
+			t.Parallel()
 			c := newCluster(t, n)
 			old, _ := c.waitForStableLeader(firstElectionWithin)
 			c.crash(old)

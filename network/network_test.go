@@ -85,6 +85,7 @@ func call(e *Endpoint, to int, method string, args *Args, wait time.Duration) (R
 }
 
 func TestCallReturnsReply(t *testing.T) {
+	t.Parallel()
 	_, eps, _ := setup(2)
 	reply, err := call(eps[0], 1, "Echo.Double", &Args{X: 21}, deliverWait)
 	if err != nil || reply.Y != 42 {
@@ -93,6 +94,7 @@ func TestCallReturnsReply(t *testing.T) {
 }
 
 func TestHandlerGetsACopyOfArgs(t *testing.T) {
+	t.Parallel()
 	_, eps, _ := setup(2)
 	args := &Args{Items: []int{7}}
 	if _, err := call(eps[0], 1, "Echo.Clobber", args, deliverWait); err != nil {
@@ -104,6 +106,7 @@ func TestHandlerGetsACopyOfArgs(t *testing.T) {
 }
 
 func TestPartition(t *testing.T) {
+	t.Parallel()
 	n, eps, echos := setup(3)
 	n.Partition([]int{0, 1}, []int{2})
 	if _, err := call(eps[0], 1, "Echo.Double", &Args{}, deliverWait); err != nil {
@@ -125,6 +128,7 @@ func TestPartition(t *testing.T) {
 // happens but the caller never hears back. A client that retries has to cope
 // with exactly this.
 func TestReplyLostAfterHandlerRan(t *testing.T) {
+	t.Parallel()
 	cuts := []struct {
 		name string
 		cut  func(n *Network)
@@ -134,6 +138,7 @@ func TestReplyLostAfterHandlerRan(t *testing.T) {
 	}
 	for _, tc := range cuts {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			n, eps, echos := setup(2)
 			errc := make(chan error, 1)
 			go func() {
@@ -151,6 +156,7 @@ func TestReplyLostAfterHandlerRan(t *testing.T) {
 }
 
 func TestCrashAndRestart(t *testing.T) {
+	t.Parallel()
 	n, eps, echos := setup(2)
 	n.Crash(1)
 	if _, err := call(eps[0], 1, "Echo.Double", &Args{}, lostWait); !errors.Is(err, context.DeadlineExceeded) {
@@ -173,6 +179,7 @@ func TestCrashAndRestart(t *testing.T) {
 }
 
 func TestDelay(t *testing.T) {
+	t.Parallel()
 	n, eps, _ := setup(2)
 	const d = 20 * time.Millisecond
 	n.SetDelay(d, d)
@@ -189,6 +196,7 @@ func TestDelay(t *testing.T) {
 // 100 choices at a 0.5 drop rate, seeing only one outcome has probability
 // 2^-99, so the second check won't flake.
 func TestSameSeedSameChoices(t *testing.T) {
+	t.Parallel()
 	seed := rand.Uint64()
 	choices := func() []bool {
 		n := New(seed)
@@ -210,6 +218,7 @@ func TestSameSeedSameChoices(t *testing.T) {
 }
 
 func TestMisusePanics(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name   string
 		misuse func(ctx context.Context, n *Network, e *Endpoint)
@@ -244,6 +253,7 @@ func TestMisusePanics(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			n, eps, _ := setup(2)
 			ctx, cancel := context.WithTimeout(context.Background(), deliverWait)
 			defer cancel()
