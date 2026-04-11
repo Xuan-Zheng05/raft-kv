@@ -2,7 +2,10 @@ package raft
 
 import (
 	"flag"
+	"fmt"
 	"math/rand/v2"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +19,12 @@ var seedFlag = flag.Uint64("seed", 0, "seed for the simulated network; 0 picks a
 // within a fraction of one timeout.
 const pollEvery = 10 * time.Millisecond
 
+// attemptWithin is how long one waits for a submitted command to be applied
+// before submitting it again. Twice the longest election timeout is plenty
+// for a live leader to get a command through a few lost messages, and if the
+// leader has lost its job, it's enough time for a new one to be elected.
+const attemptWithin = 2 * electionTimeoutMax
+
 // cluster is a group of Raft servers talking over a simulated network, all
 // inside one test process.
 type cluster struct {
@@ -27,6 +36,16 @@ type cluster struct {
 	// leaders in the same term get caught even if we saw them at different
 	// moments.
 	leaderOf map[int]int
+	// plan is where randomized tests get their choices. It's seeded like the
+	// network, so rerunning with -seed replays the same plan.
+	plan *rand.Rand
+
+	// The collect goroutines write these, so they're guarded by mu.
+	mu          sync.Mutex
+	appliedUpTo []int         // the last index each server has applied
+	committed   map[int]any   // the command at each index, as applied by whichever server got there first
+	applyErr    error         // the first time a server applied something it shouldn't have
+	stop        chan struct{} // closed when the test ends, so the collect goroutines exit
 }
 
 // newCluster starts n servers. If the test fails, it prints the network's
@@ -38,11 +57,15 @@ func newCluster(t *testing.T, n int) *cluster {
 		seed = rand.Uint64()
 	}
 	c := &cluster{
-		t:        t,
-		net:      network.New(seed),
-		rafts:    make([]*Raft, n),
-		alive:    make([]bool, n),
-		leaderOf: make(map[int]int),
+		t:           t,
+		net:         network.New(seed),
+		rafts:       make([]*Raft, n),
+		alive:       make([]bool, n),
+		leaderOf:    make(map[int]int),
+		plan:        rand.New(rand.NewPCG(seed, 0)),
+		appliedUpTo: make([]int, n),
+		committed:   make(map[int]any),
+		stop:        make(chan struct{}),
 	}
 	for i := range n {
 		c.start(i)
@@ -53,6 +76,12 @@ func newCluster(t *testing.T, n int) *cluster {
 				rf.Kill()
 			}
 		}
+		close(c.stop)
+		c.mu.Lock()
+		if c.applyErr != nil {
+			t.Error(c.applyErr)
+		}
+		c.mu.Unlock()
 		if t.Failed() {
 			t.Logf("network seed %d (rerun with -seed=%d)", seed, seed)
 		}
@@ -60,14 +89,15 @@ func newCluster(t *testing.T, n int) *cluster {
 	return c
 }
 
-// start boots a fresh instance of server i; after a crash, calling it again
-// is a restart. Make has to come before Serve: Raft needs its Endpoint to be
-// built, and only a built Raft can handle calls.
+// start boots a fresh instance of server i. Make has to come before Serve:
+// Raft needs its Endpoint to be built, and only a built Raft can handle calls.
 func (c *cluster) start(i int) {
 	ep := c.net.Connect(i)
-	c.rafts[i] = Make(ep, i, len(c.rafts))
+	applyCh := make(chan ApplyMsg)
+	c.rafts[i] = Make(ep, i, len(c.rafts), applyCh)
 	ep.Serve(c.rafts[i])
 	c.alive[i] = true
+	go c.collect(i, applyCh)
 }
 
 // crash kills server i. Both halves matter: the network stops delivering to
@@ -77,6 +107,106 @@ func (c *cluster) crash(i int) {
 	c.net.Crash(i)
 	c.rafts[i].Kill()
 	c.alive[i] = false
+}
+
+// collect records everything server i applies and checks it on the way in.
+// Each server has to apply indexes in order with no gaps, and no two servers
+// may ever apply different commands at the same index.
+func (c *cluster) collect(i int, applyCh <-chan ApplyMsg) {
+	for {
+		select {
+		case <-c.stop:
+			return
+		case msg := <-applyCh:
+			c.mu.Lock()
+			if c.applyErr == nil {
+				want := c.appliedUpTo[i] + 1
+				prev, seen := c.committed[msg.Index]
+				switch {
+				case msg.Index != want:
+					c.applyErr = fmt.Errorf("server %d applied index %d, but the next one should have been %d", i, msg.Index, want)
+				case seen && prev != msg.Command:
+					c.applyErr = fmt.Errorf("server %d applied %v at index %d, but another server applied %v there", i, msg.Command, msg.Index, prev)
+				default:
+					c.appliedUpTo[i] = msg.Index
+					c.committed[msg.Index] = msg.Command
+				}
+			}
+			c.mu.Unlock()
+		}
+	}
+}
+
+// appliedAt reports how many servers have applied index, and which command
+// is there. It fails the test if collect has found a problem.
+func (c *cluster) appliedAt(index int) (count int, cmd any) {
+	c.t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.applyErr != nil {
+		c.t.Fatal(c.applyErr)
+	}
+	for _, upTo := range c.appliedUpTo {
+		if upTo >= index {
+			count++
+		}
+	}
+	return count, c.committed[index]
+}
+
+// one submits cmd and waits until at least want servers have applied it, and
+// returns the index it landed at. It gives cmd to the leader with the highest
+// term, since a leader cut off from the others may still think it's in
+// charge. If cmd doesn't get applied in time, say because that leader lost
+// its job first, one submits it again.
+func (c *cluster) one(cmd any, want int) int {
+	c.t.Helper()
+	within := reelectionWithin + attemptWithin // time for a new leader to take over, then one full attempt
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		leader, best := -1, -1
+		for i, rf := range c.rafts {
+			if !c.alive[i] {
+				continue
+			}
+			if term, isLeader := rf.State(); isLeader && term > best {
+				leader, best = i, term
+			}
+		}
+		if leader < 0 {
+			time.Sleep(pollEvery)
+			continue
+		}
+		index, _, ok := c.rafts[leader].Start(cmd)
+		if !ok {
+			continue
+		}
+
+		attemptEnd := time.Now().Add(attemptWithin)
+		for time.Now().Before(attemptEnd) {
+			count, got := c.appliedAt(index)
+			if got != nil && got != cmd {
+				break // a different command won this index, so submit cmd again
+			}
+			if count >= want {
+				return index
+			}
+			time.Sleep(pollEvery)
+		}
+	}
+	c.t.Fatalf("command %v wasn't applied by %d servers within %v", cmd, want, within)
+	return 0
+}
+
+// others returns every server id from 0 to n-1 except the ones given.
+func others(n int, except ...int) []int {
+	var ids []int
+	for i := range n {
+		if !slices.Contains(except, i) {
+			ids = append(ids, i)
+		}
+	}
+	return ids
 }
 
 // waitForLeader waits up to within for exactly one live server to think it's
