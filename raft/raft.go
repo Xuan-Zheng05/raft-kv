@@ -4,7 +4,10 @@
 package raft
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
+	"fmt"
 	"math/rand/v2"
 	"slices"
 	"sync"
@@ -62,12 +65,13 @@ type ApplyMsg struct {
 type Raft struct {
 	mu      sync.Mutex
 	peers   Transport
+	storage Storage
 	me      int // this server's id
 	n       int // how many servers are in the cluster, counting this one
 	applyCh chan<- ApplyMsg
 
-	// Persistent state, straight from Figure 2. The paper requires these to
-	// survive a crash.
+	// Persistent state, straight from Figure 2. These have to survive a
+	// crash, so every change to them goes through persist.
 	currentTerm int
 	votedFor    int // who we voted for in currentTerm, or noVote
 	// log[0] is a placeholder with term 0, so real entries start at index 1
@@ -127,14 +131,27 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+// persistentState is what persist writes: Figure 2's persistent state.
+type persistentState struct {
+	CurrentTerm int
+	VotedFor    int
+	Log         []LogEntry
+}
+
 // Make starts a Raft server. Servers are numbered 0 to n-1, this one is me,
-// and peers is how it reaches the others. Committed commands come out of
-// applyCh in log order. Make returns right away; the server's goroutines run
-// until Kill.
-func Make(peers Transport, me, n int, applyCh chan<- ApplyMsg) *Raft {
+// and peers is how it reaches the others. storage holds whatever this server
+// saved before it last crashed, if anything, and it's where the server saves
+// from now on. Committed commands come out of applyCh in log order. Make
+// returns right away; the server's goroutines run until Kill.
+//
+// A restarted server picks up its term, vote and log, but nothing else:
+// commitIndex starts at 0 again, so it hands its log to applyCh again from
+// the beginning as the leader tells it what's committed.
+func Make(peers Transport, me, n int, storage Storage, applyCh chan<- ApplyMsg) *Raft {
 	ctx, cancel := context.WithCancel(context.Background())
 	rf := &Raft{
 		peers:      peers,
+		storage:    storage,
 		me:         me,
 		n:          n,
 		applyCh:    applyCh,
@@ -145,6 +162,16 @@ func Make(peers Transport, me, n int, applyCh chan<- ApplyMsg) *Raft {
 		applyKick:  make(chan struct{}, 1),
 		ctx:        ctx,
 		cancel:     cancel,
+	}
+	if data := storage.Load(); len(data) > 0 {
+		// Decode into a fresh value: gob leaves fields that are zero on the
+		// wire untouched, so decoding over values that are already set could
+		// keep stale ones.
+		var saved persistentState
+		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&saved); err != nil {
+			panic(fmt.Sprintf("raft: server %d can't read its saved state: %v", me, err))
+		}
+		rf.currentTerm, rf.votedFor, rf.log = saved.CurrentTerm, saved.VotedFor, saved.Log
 	}
 	rf.resetElectionTimer() // no lock needed: no other goroutine can see rf yet
 	go rf.ticker()
@@ -163,7 +190,8 @@ func (rf *Raft) Start(command any) (index, term int, isLeader bool) {
 		return 0, rf.currentTerm, false
 	}
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
-	rf.matchIndex[rf.me] = len(rf.log) - 1 // the leader's own copy counts toward a majority
+	rf.persist()
+	rf.matchIndex[rf.me] = len(rf.log) - 1 // the leader's own copy counts toward a majority, so it has to be saved first
 	return len(rf.log) - 1, rf.currentTerm, true
 }
 
@@ -215,6 +243,7 @@ func (rf *Raft) startElection() {
 	rf.role = candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.persist() // before any vote request goes out
 	rf.resetElectionTimer()
 
 	term := rf.currentTerm
@@ -432,6 +461,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 		(args.LastLogTerm == rf.log[last].Term && args.LastLogIndex >= last)
 	if (rf.votedFor == noVote || rf.votedFor == args.CandidateID) && upToDate {
 		rf.votedFor = args.CandidateID
+		// Save before the candidate hears yes. Otherwise a crash could make us
+		// forget this vote and vote again in the same term.
+		rf.persist()
 		rf.resetElectionTimer() // granting a vote resets the timer; refusing one doesn't
 		reply.VoteGranted = true
 	}
@@ -480,6 +512,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = rf.log[:index]
 		}
 		rf.log = append(rf.log, args.Entries[i:]...)
+		rf.persist() // before we tell the leader we have these
 		break
 	}
 
@@ -502,6 +535,20 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.currentTerm = term
 	rf.votedFor = noVote
 	rf.role = follower
+	rf.persist()
+}
+
+// persist saves currentTerm, votedFor and log. Everything that changes one of
+// them calls this before letting go of rf.mu, which is always before the
+// change can reach another server: replies go out after a handler returns,
+// and requests go out after the lock is released. The caller must hold rf.mu.
+func (rf *Raft) persist() {
+	var buf bytes.Buffer
+	state := persistentState{CurrentTerm: rf.currentTerm, VotedFor: rf.votedFor, Log: rf.log}
+	if err := gob.NewEncoder(&buf).Encode(state); err != nil {
+		panic(fmt.Sprintf("raft: server %d can't save its state: %v", rf.me, err))
+	}
+	rf.storage.Save(buf.Bytes())
 }
 
 // resetElectionTimer moves the election deadline to a new random point in the

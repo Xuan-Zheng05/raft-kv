@@ -28,10 +28,11 @@ const attemptWithin = 2 * electionTimeoutMax
 // cluster is a group of Raft servers talking over a simulated network, all
 // inside one test process.
 type cluster struct {
-	t     *testing.T
-	net   *network.Network
-	rafts []*Raft
-	alive []bool
+	t       *testing.T
+	net     *network.Network
+	rafts   []*Raft
+	alive   []bool
+	storage []*MemStorage // what each server has saved; outlives the server itself
 	// leaderOf remembers who was leader in each term we've seen, so two
 	// leaders in the same term get caught even if we saw them at different
 	// moments.
@@ -42,7 +43,8 @@ type cluster struct {
 
 	// The collect goroutines write these, so they're guarded by mu.
 	mu          sync.Mutex
-	appliedUpTo []int         // the last index each server has applied
+	life        []int         // counts each server's restarts, so collect can ignore a dead instance
+	appliedUpTo []int         // the last index each server's current instance has applied
 	committed   map[int]any   // the command at each index, as applied by whichever server got there first
 	applyErr    error         // the first time a server applied something it shouldn't have
 	stop        chan struct{} // closed when the test ends, so the collect goroutines exit
@@ -61,8 +63,10 @@ func newCluster(t *testing.T, n int) *cluster {
 		net:         network.New(seed),
 		rafts:       make([]*Raft, n),
 		alive:       make([]bool, n),
+		storage:     make([]*MemStorage, n),
 		leaderOf:    make(map[int]int),
 		plan:        rand.New(rand.NewPCG(seed, 0)),
+		life:        make([]int, n),
 		appliedUpTo: make([]int, n),
 		committed:   make(map[int]any),
 		stop:        make(chan struct{}),
@@ -89,15 +93,32 @@ func newCluster(t *testing.T, n int) *cluster {
 	return c
 }
 
-// start boots a fresh instance of server i. Make has to come before Serve:
-// Raft needs its Endpoint to be built, and only a built Raft can handle calls.
+// start boots a fresh instance of server i; after a crash, that's a
+// restart. Make has to come before Serve: Raft needs its Endpoint to be
+// built, and only a built Raft can handle calls.
 func (c *cluster) start(i int) {
+	// The new instance gets a copy of what the old one saved, so goroutines
+	// the old one left behind can't write into the new one's storage.
+	storage := &MemStorage{}
+	if old := c.storage[i]; old != nil {
+		storage.Save(old.Load())
+	}
+	c.storage[i] = storage
+
+	// A restarted server applies its log again from the start, so collect
+	// starts over for it too.
+	c.mu.Lock()
+	c.life[i]++
+	life := c.life[i]
+	c.appliedUpTo[i] = 0
+	c.mu.Unlock()
+
 	ep := c.net.Connect(i)
 	applyCh := make(chan ApplyMsg)
-	c.rafts[i] = Make(ep, i, len(c.rafts), applyCh)
+	c.rafts[i] = Make(ep, i, len(c.rafts), storage, applyCh)
 	ep.Serve(c.rafts[i])
 	c.alive[i] = true
-	go c.collect(i, applyCh)
+	go c.collect(i, life, applyCh)
 }
 
 // crash kills server i. Both halves matter: the network stops delivering to
@@ -109,16 +130,21 @@ func (c *cluster) crash(i int) {
 	c.alive[i] = false
 }
 
-// collect records everything server i applies and checks it on the way in.
-// Each server has to apply indexes in order with no gaps, and no two servers
-// may ever apply different commands at the same index.
-func (c *cluster) collect(i int, applyCh <-chan ApplyMsg) {
+// collect records everything one instance of server i applies, and checks
+// it on the way in. Each server has to apply indexes in order with no gaps,
+// and no two servers may ever apply different commands at the same index.
+// Once server i restarts, this instance is dead and collect stops listening.
+func (c *cluster) collect(i, life int, applyCh <-chan ApplyMsg) {
 	for {
 		select {
 		case <-c.stop:
 			return
 		case msg := <-applyCh:
 			c.mu.Lock()
+			if c.life[i] != life {
+				c.mu.Unlock()
+				return
+			}
 			if c.applyErr == nil {
 				want := c.appliedUpTo[i] + 1
 				prev, seen := c.committed[msg.Index]
@@ -165,12 +191,10 @@ func (c *cluster) one(cmd any, want int) int {
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
 		leader, best := -1, -1
-		for i, rf := range c.rafts {
-			if !c.alive[i] {
-				continue
-			}
-			if term, isLeader := rf.State(); isLeader && term > best {
-				leader, best = i, term
+		ids, terms := c.leaders()
+		for k, id := range ids {
+			if terms[k] > best {
+				leader, best = id, terms[k]
 			}
 		}
 		if leader < 0 {
@@ -209,28 +233,35 @@ func others(n int, except ...int) []int {
 	return ids
 }
 
+// leaders returns the live servers that think they're the leader right now,
+// with their terms. It also checks Raft's core safety rule every time: no
+// term ever has two leaders.
+func (c *cluster) leaders() (ids, terms []int) {
+	c.t.Helper()
+	for i, rf := range c.rafts {
+		if !c.alive[i] {
+			continue
+		}
+		t, isLeader := rf.State()
+		if !isLeader {
+			continue
+		}
+		if prev, seen := c.leaderOf[t]; seen && prev != i {
+			c.t.Fatalf("servers %d and %d were both leader in term %d", prev, i, t)
+		}
+		c.leaderOf[t] = i
+		ids, terms = append(ids, i), append(terms, t)
+	}
+	return ids, terms
+}
+
 // waitForLeader waits up to within for exactly one live server to think it's
-// the leader, and returns that server and its term. While it polls, it also
-// checks Raft's core safety rule: no term ever has two leaders.
+// the leader, and returns that server and its term.
 func (c *cluster) waitForLeader(within time.Duration) (id, term int) {
 	c.t.Helper()
 	deadline := time.Now().Add(within)
 	for {
-		var ids, terms []int
-		for i, rf := range c.rafts {
-			if !c.alive[i] {
-				continue
-			}
-			t, isLeader := rf.State()
-			if !isLeader {
-				continue
-			}
-			if prev, seen := c.leaderOf[t]; seen && prev != i {
-				c.t.Fatalf("servers %d and %d were both leader in term %d", prev, i, t)
-			}
-			c.leaderOf[t] = i
-			ids, terms = append(ids, i), append(terms, t)
-		}
+		ids, terms := c.leaders()
 		if len(ids) == 1 {
 			return ids[0], terms[0]
 		}
