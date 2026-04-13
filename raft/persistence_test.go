@@ -100,12 +100,14 @@ func TestSavedStateSurvivesRestart(t *testing.T) {
 // Every server crashes and comes back. Afterwards they still agree on what
 // was committed before, and they carry on. Without saved state they'd come
 // back with empty logs and commit new commands at old indexes, which collect
-// would catch.
+// would catch. Enough gets committed first for every server to take a
+// snapshot, so each one also comes back from a snapshot plus the entries
+// after it.
 func TestRestartAll(t *testing.T) {
 	t.Parallel()
 	const n = 3
 	c := newCluster(t, n)
-	for cmd := 1; cmd <= 3; cmd++ {
+	for cmd := 1; cmd <= snapshotEvery+3; cmd++ {
 		c.one(cmd, n)
 	}
 	for i := range n {

@@ -1,6 +1,7 @@
-// Package raft is a Raft consensus server, built from Section 5 and Figure 2
-// of the Raft paper. It elects a leader, copies the leader's log to the other
-// servers, and hands committed commands to the application in log order.
+// Package raft is a Raft consensus server, built from Sections 5 and 7 and
+// Figures 2 and 13 of the Raft paper. It elects a leader, copies the leader's
+// log to the other servers, hands committed commands to the application in
+// log order, and keeps the log short with snapshots the application provides.
 package raft
 
 import (
@@ -54,11 +55,16 @@ type LogEntry struct {
 	Command any
 }
 
-// ApplyMsg is how a server hands a committed command to the application.
-// They arrive in log order, one index at a time, with no gaps.
+// ApplyMsg is how a server hands committed work to the application, in log
+// order. Usually it's one command. When the server has been sent a snapshot,
+// or is starting up from one, it's that snapshot instead: it stands in for
+// every command up to Index, and the application should replace its state
+// with it.
 type ApplyMsg struct {
-	Index   int
-	Command any
+	Index      int
+	Command    any // the command at Index, unless IsSnapshot
+	IsSnapshot bool
+	Snapshot   []byte // the application's state with everything up to Index applied
 }
 
 // Raft is one server in a Raft cluster.
@@ -70,13 +76,21 @@ type Raft struct {
 	n       int // how many servers are in the cluster, counting this one
 	applyCh chan<- ApplyMsg
 
-	// Persistent state, straight from Figure 2. These have to survive a
-	// crash, so every change to them goes through persist.
+	// Persistent state: Figure 2's, plus what the snapshot covers. These have
+	// to survive a crash, so every change to them goes through persist.
 	currentTerm int
 	votedFor    int // who we voted for in currentTerm, or noVote
-	// log[0] is a placeholder with term 0, so real entries start at index 1
-	// like in the paper, and "the last entry" always exists.
-	log []LogEntry
+	// The log only holds what comes after the snapshot. log[0] stands for the
+	// last entry the snapshot covers: index lastIncludedIndex, term
+	// log[0].Term. With no snapshot yet that's index 0 and term 0, so real
+	// entries start at index 1 like in the paper. Either way, the entry
+	// before the first real one always exists. pos turns a log index into a
+	// position in this slice.
+	log               []LogEntry
+	lastIncludedIndex int
+	// snapshot is the application's state up to lastIncludedIndex. It only
+	// ever gets replaced, never changed in place, so it's safe to hand out.
+	snapshot []byte
 
 	// Volatile state on every server, from Figure 2.
 	commitIndex int // the highest log index known to be committed
@@ -90,7 +104,7 @@ type Raft struct {
 	// The rest is our own bookkeeping, not from the paper.
 	role             role
 	electionDeadline time.Time     // if nothing pushes this back first, we start an election
-	applyKick        chan struct{} // wakes the applier when commitIndex moves; holds at most one nudge
+	applyKick        chan struct{} // wakes the applier when there's more to apply; holds at most one nudge
 
 	// ctx lives as long as the server does. Kill cancels it, which stops all
 	// of this server's goroutines and abandons every RPC it still has in
@@ -131,11 +145,28 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-// persistentState is what persist writes: Figure 2's persistent state.
+// InstallSnapshotArgs is what a leader sends a server that's so far behind
+// that the entries it needs have been compacted away: the leader's whole
+// snapshot, and the index and term of the last entry it covers.
+type InstallSnapshotArgs struct {
+	Term              int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+// InstallSnapshotReply is the answer. Term lets a leader that's behind find
+// out.
+type InstallSnapshotReply struct {
+	Term int
+}
+
+// persistentState is what persist writes, next to the snapshot.
 type persistentState struct {
-	CurrentTerm int
-	VotedFor    int
-	Log         []LogEntry
+	CurrentTerm       int
+	VotedFor          int
+	Log               []LogEntry
+	LastIncludedIndex int
 }
 
 // Make starts a Raft server. Servers are numbered 0 to n-1, this one is me,
@@ -144,9 +175,11 @@ type persistentState struct {
 // from now on. Committed commands come out of applyCh in log order. Make
 // returns right away; the server's goroutines run until Kill.
 //
-// A restarted server picks up its term, vote and log, but nothing else:
-// commitIndex starts at 0 again, so it hands its log to applyCh again from
-// the beginning as the leader tells it what's committed.
+// A restarted server picks up its term, vote, log and snapshot. Everything
+// the snapshot covers is committed, so that's where commitIndex starts. The
+// first thing it hands to applyCh is the snapshot, so the application can
+// rebuild its state from it, and then the entries after it as the leader
+// tells the server they're committed.
 func Make(peers Transport, me, n int, storage Storage, applyCh chan<- ApplyMsg) *Raft {
 	ctx, cancel := context.WithCancel(context.Background())
 	rf := &Raft{
@@ -163,15 +196,22 @@ func Make(peers Transport, me, n int, storage Storage, applyCh chan<- ApplyMsg) 
 		ctx:        ctx,
 		cancel:     cancel,
 	}
-	if data := storage.Load(); len(data) > 0 {
+	state, snapshot := storage.Load()
+	if len(state) > 0 {
 		// Decode into a fresh value: gob leaves fields that are zero on the
 		// wire untouched, so decoding over values that are already set could
 		// keep stale ones.
 		var saved persistentState
-		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&saved); err != nil {
+		if err := gob.NewDecoder(bytes.NewReader(state)).Decode(&saved); err != nil {
 			panic(fmt.Sprintf("raft: server %d can't read its saved state: %v", me, err))
 		}
-		rf.currentTerm, rf.votedFor, rf.log = saved.CurrentTerm, saved.VotedFor, saved.Log
+		rf.currentTerm, rf.votedFor = saved.CurrentTerm, saved.VotedFor
+		rf.log, rf.lastIncludedIndex = saved.Log, saved.LastIncludedIndex
+	}
+	rf.snapshot = snapshot
+	rf.commitIndex = rf.lastIncludedIndex
+	if rf.lastIncludedIndex > 0 {
+		rf.kickApplier()
 	}
 	rf.resetElectionTimer() // no lock needed: no other goroutine can see rf yet
 	go rf.ticker()
@@ -191,8 +231,29 @@ func (rf *Raft) Start(command any) (index, term int, isLeader bool) {
 	}
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
 	rf.persist()
-	rf.matchIndex[rf.me] = len(rf.log) - 1 // the leader's own copy counts toward a majority, so it has to be saved first
-	return len(rf.log) - 1, rf.currentTerm, true
+	index = rf.lastIndex()
+	rf.matchIndex[rf.me] = index // the leader's own copy counts toward a majority, so it has to be saved first
+	return index, rf.currentTerm, true
+}
+
+// Snapshot tells the server that the application has captured its state,
+// with everything up to index applied, in data. The server keeps data in
+// place of the log entries it covers and drops them. The application calls
+// this some time after it has applied index; if the server has moved past
+// index by then (say the leader sent it a newer snapshot), the call does
+// nothing.
+func (rf *Raft) Snapshot(index int, data []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if index <= rf.lastIncludedIndex {
+		return
+	}
+	if index > rf.lastApplied {
+		panic(fmt.Sprintf("raft: server %d was asked to snapshot up to index %d, but it has only applied up to %d", rf.me, index, rf.lastApplied))
+	}
+	rf.trimLog(index)
+	rf.snapshot = slices.Clone(data) // our own copy, since the application might reuse its buffer
+	rf.persist()
 }
 
 // State returns this server's current term and whether it believes it's the
@@ -247,8 +308,8 @@ func (rf *Raft) startElection() {
 	rf.resetElectionTimer()
 
 	term := rf.currentTerm
-	last := len(rf.log) - 1
-	args := &RequestVoteArgs{Term: term, CandidateID: rf.me, LastLogIndex: last, LastLogTerm: rf.log[last].Term}
+	last := rf.lastIndex()
+	args := &RequestVoteArgs{Term: term, CandidateID: rf.me, LastLogIndex: last, LastLogTerm: rf.termAt(last)}
 	// A vote that shows up after this election has timed out is no use to
 	// us, because by then we've moved on to a new term. So that's exactly how
 	// long each request gets.
@@ -285,10 +346,10 @@ func (rf *Raft) startElection() {
 				// that's wrong, the follower turns down our AppendEntries and
 				// we step back until we find where the logs agree.
 				for i := range rf.n {
-					rf.nextIndex[i] = len(rf.log)
+					rf.nextIndex[i] = rf.lastIndex() + 1
 					rf.matchIndex[i] = 0
 				}
-				rf.matchIndex[rf.me] = len(rf.log) - 1
+				rf.matchIndex[rf.me] = rf.lastIndex()
 				go rf.replicate(term)
 			}
 		}()
@@ -296,8 +357,9 @@ func (rf *Raft) startElection() {
 }
 
 // replicate runs for as long as this server is the leader of term. Right
-// away, and then every heartbeatInterval, it sends every other server the
-// entries it's missing. A server that's caught up gets an empty
+// away, and then every heartbeatInterval, it sends every other server what
+// it's missing: the entries after the ones it has, or our snapshot if those
+// entries have been compacted away. A server that's caught up gets an empty
 // AppendEntries, which is a heartbeat.
 func (rf *Raft) replicate(term int) {
 	for {
@@ -311,13 +373,23 @@ func (rf *Raft) replicate(term int) {
 				continue
 			}
 			prev := rf.nextIndex[peer] - 1
+			if prev < rf.lastIncludedIndex {
+				args := &InstallSnapshotArgs{
+					Term:              term,
+					LastIncludedIndex: rf.lastIncludedIndex,
+					LastIncludedTerm:  rf.log[0].Term,
+					Data:              rf.snapshot,
+				}
+				go rf.sendSnapshot(term, peer, args)
+				continue
+			}
 			args := &AppendEntriesArgs{
 				Term:         term,
 				PrevLogIndex: prev,
-				PrevLogTerm:  rf.log[prev].Term,
+				PrevLogTerm:  rf.termAt(prev),
 				// A copy, because the network reads these after we let go of
 				// the lock, and by then our log may have changed.
-				Entries:      slices.Clone(rf.log[prev+1:]),
+				Entries:      slices.Clone(rf.log[rf.pos(prev)+1:]),
 				LeaderCommit: rf.commitIndex,
 			}
 			go rf.sendEntries(term, peer, args)
@@ -376,6 +448,35 @@ func (rf *Raft) sendEntries(term, peer int, args *AppendEntriesArgs) {
 	}
 }
 
+// sendSnapshot sends our snapshot to peer and acts on the answer.
+func (rf *Raft) sendSnapshot(term, peer int, args *InstallSnapshotArgs) {
+	// The same wait as sendEntries, for the same reason.
+	ctx, cancel := context.WithTimeout(rf.ctx, electionTimeoutMin)
+	defer cancel()
+	var reply InstallSnapshotReply
+	if err := rf.peers.Call(ctx, peer, "Raft.InstallSnapshot", args, &reply); err != nil {
+		return // lost; the next round tries again
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
+		rf.becomeFollower(reply.Term)
+		return
+	}
+	if rf.role != leader || rf.currentTerm != term {
+		return
+	}
+	// peer now has everything the snapshot covers: either it just installed
+	// it, or it had already committed that far, which means the same thing.
+	// Everything a snapshot covers is committed already, so there's nothing
+	// new to commit here.
+	if args.LastIncludedIndex > rf.matchIndex[peer] {
+		rf.matchIndex[peer] = args.LastIncludedIndex
+		rf.nextIndex[peer] = args.LastIncludedIndex + 1
+	}
+}
+
 // advanceCommit moves commitIndex up to the newest entry that a majority of
 // servers have stored, as long as that entry is from the current term. The
 // caller must hold rf.mu.
@@ -386,7 +487,7 @@ func (rf *Raft) sendEntries(term, peer int, args *AppendEntriesArgs) {
 // Older entries still get committed, just indirectly: committing an entry
 // commits everything before it.
 func (rf *Raft) advanceCommit() {
-	for index := len(rf.log) - 1; index > rf.commitIndex && rf.log[index].Term == rf.currentTerm; index-- {
+	for index := rf.lastIndex(); index > rf.commitIndex && rf.termAt(index) == rf.currentTerm; index-- {
 		copies := 0
 		for _, match := range rf.matchIndex {
 			if match >= index {
@@ -401,10 +502,10 @@ func (rf *Raft) advanceCommit() {
 	}
 }
 
-// applier hands committed entries to applyCh, in order. It has its own
+// applier hands committed work to applyCh, in order. It has its own
 // goroutine so that sending on applyCh never happens while holding rf.mu: the
-// application reading applyCh may call Start, which needs the lock, and the
-// two would wait on each other forever.
+// application reading applyCh may call Start or Snapshot, which need the
+// lock, and the two would wait on each other forever.
 func (rf *Raft) applier() {
 	for {
 		select {
@@ -413,24 +514,41 @@ func (rf *Raft) applier() {
 		case <-rf.applyKick:
 		}
 
-		rf.mu.Lock()
-		first := rf.lastApplied + 1
-		entries := slices.Clone(rf.log[first : rf.commitIndex+1])
-		rf.lastApplied = rf.commitIndex
-		rf.mu.Unlock()
+		// Keep going until there's nothing left, since one nudge can stand
+		// for several changes.
+		for {
+			rf.mu.Lock()
+			var msgs []ApplyMsg
+			if rf.lastApplied < rf.lastIncludedIndex {
+				// We've been sent a snapshot past what we've applied, or we're
+				// starting up from one. It replaces everything up to its index,
+				// so it goes out on its own, before anything after it.
+				msgs = append(msgs, ApplyMsg{Index: rf.lastIncludedIndex, IsSnapshot: true, Snapshot: rf.snapshot})
+				rf.lastApplied = rf.lastIncludedIndex
+			} else {
+				for index := rf.lastApplied + 1; index <= rf.commitIndex; index++ {
+					msgs = append(msgs, ApplyMsg{Index: index, Command: rf.log[rf.pos(index)].Command})
+				}
+				rf.lastApplied = rf.commitIndex
+			}
+			rf.mu.Unlock()
 
-		for i, entry := range entries {
-			select {
-			case rf.applyCh <- ApplyMsg{Index: first + i, Command: entry.Command}:
-			case <-rf.ctx.Done():
-				return
+			if len(msgs) == 0 {
+				break
+			}
+			for _, msg := range msgs {
+				select {
+				case rf.applyCh <- msg:
+				case <-rf.ctx.Done():
+					return
+				}
 			}
 		}
 	}
 }
 
 // kickApplier wakes the applier without waiting for it. If a nudge is already
-// pending, that one is enough: the applier reads commitIndex fresh each time
+// pending, that one is enough: the applier reads everything fresh each time
 // it wakes.
 func (rf *Raft) kickApplier() {
 	select {
@@ -456,9 +574,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 	// (Section 5.4.1): its last entry has a later term, or the same term and
 	// the log is at least as long. This is what guarantees a new leader
 	// already has every committed entry.
-	last := len(rf.log) - 1
-	upToDate := args.LastLogTerm > rf.log[last].Term ||
-		(args.LastLogTerm == rf.log[last].Term && args.LastLogIndex >= last)
+	last := rf.lastIndex()
+	upToDate := args.LastLogTerm > rf.termAt(last) ||
+		(args.LastLogTerm == rf.termAt(last) && args.LastLogIndex >= last)
 	if (rf.votedFor == noVote || rf.votedFor == args.CandidateID) && upToDate {
 		rf.votedFor = args.CandidateID
 		// Save before the candidate hears yes. Otherwise a crash could make us
@@ -490,10 +608,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.role = follower
 	rf.resetElectionTimer()
 
+	// Any part of the message our snapshot already covers can be skipped. A
+	// snapshot only ever holds committed entries, and committed entries match
+	// the leader's, so we know our log lines up with the leader's at
+	// lastIncludedIndex.
+	prev, prevTerm, entries := args.PrevLogIndex, args.PrevLogTerm, args.Entries
+	if prev < rf.lastIncludedIndex {
+		skip := min(rf.lastIncludedIndex-prev, len(entries))
+		prev, prevTerm, entries = rf.lastIncludedIndex, rf.log[0].Term, entries[skip:]
+	}
+
 	// Only take the entries if we have the entry they're meant to follow.
 	// This check is what keeps every log an exact copy of the leader's, up to
 	// the point where they agree.
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if prev > rf.lastIndex() || rf.termAt(prev) != prevTerm {
 		return nil
 	}
 
@@ -503,15 +631,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// because a message is shorter than our log: it may be an old message
 	// that arrived late, and cutting would throw away entries we've already
 	// told the leader we have.
-	for i, entry := range args.Entries {
-		index := args.PrevLogIndex + 1 + i
-		if index < len(rf.log) {
-			if rf.log[index].Term == entry.Term {
+	for i, entry := range entries {
+		index := prev + 1 + i
+		if index <= rf.lastIndex() {
+			if rf.termAt(index) == entry.Term {
 				continue
 			}
-			rf.log = rf.log[:index]
+			rf.log = rf.log[:rf.pos(index)]
 		}
-		rf.log = append(rf.log, args.Entries[i:]...)
+		rf.log = append(rf.log, entries[i:]...)
 		rf.persist() // before we tell the leader we have these
 		break
 	}
@@ -527,6 +655,45 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	return nil
 }
 
+// InstallSnapshot is the handler a leader calls when this server is so far
+// behind that the entries it needs have been compacted away. It follows
+// "InstallSnapshot RPC" in Figure 13, with the whole snapshot sent in one
+// message.
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term)
+	}
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		return nil
+	}
+	rf.role = follower
+	rf.resetElectionTimer()
+
+	// A snapshot that doesn't reach past what we know is committed tells us
+	// nothing new. This is also what stops an old snapshot that arrived late
+	// from rolling us back.
+	if args.LastIncludedIndex <= rf.commitIndex {
+		return nil
+	}
+
+	if args.LastIncludedIndex <= rf.lastIndex() && rf.termAt(args.LastIncludedIndex) == args.LastIncludedTerm {
+		// Our log goes past the snapshot and agrees with it where it ends,
+		// so the entries after that are still good. Keep them.
+		rf.trimLog(args.LastIncludedIndex)
+	} else {
+		rf.log = []LogEntry{{Term: args.LastIncludedTerm}}
+		rf.lastIncludedIndex = args.LastIncludedIndex
+	}
+	rf.snapshot = args.Data
+	rf.commitIndex = args.LastIncludedIndex
+	rf.persist()
+	rf.kickApplier() // the applier sees lastApplied is behind the snapshot and hands it over
+	return nil
+}
+
 // becomeFollower moves this server to a newer term it just heard about. The
 // old vote belonged to the old term, so it's cleared. This does not reset the
 // election timer: seeing a higher term isn't the same as hearing from a
@@ -538,17 +705,54 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.persist()
 }
 
-// persist saves currentTerm, votedFor and log. Everything that changes one of
-// them calls this before letting go of rf.mu, which is always before the
-// change can reach another server: replies go out after a handler returns,
-// and requests go out after the lock is released. The caller must hold rf.mu.
+// persist saves currentTerm, votedFor and the log, together with the
+// snapshot. Everything that changes one of them calls this before letting go
+// of rf.mu, which is always before the change can reach another server:
+// replies go out after a handler returns, and requests go out after the lock
+// is released. The caller must hold rf.mu.
 func (rf *Raft) persist() {
 	var buf bytes.Buffer
-	state := persistentState{CurrentTerm: rf.currentTerm, VotedFor: rf.votedFor, Log: rf.log}
+	state := persistentState{
+		CurrentTerm:       rf.currentTerm,
+		VotedFor:          rf.votedFor,
+		Log:               rf.log,
+		LastIncludedIndex: rf.lastIncludedIndex,
+	}
 	if err := gob.NewEncoder(&buf).Encode(state); err != nil {
 		panic(fmt.Sprintf("raft: server %d can't save its state: %v", rf.me, err))
 	}
-	rf.storage.Save(buf.Bytes())
+	rf.storage.Save(buf.Bytes(), rf.snapshot)
+}
+
+// trimLog drops every entry up to index, and index itself becomes the new
+// log[0]. What's left gets copied into a new slice. Re-slicing would also
+// shorten the log, but the dropped entries would stay in memory until the
+// slice next grows, and after a burst of writes that might not be for a long
+// time. The caller must hold rf.mu.
+func (rf *Raft) trimLog(index int) {
+	rest := rf.log[rf.pos(index):]
+	rf.log = append([]LogEntry{{Term: rest[0].Term}}, rest[1:]...)
+	rf.lastIncludedIndex = index
+}
+
+// pos turns a log index into a position in rf.log. Every log lookup goes
+// through here, so the snapshot offset lives in exactly one place. The index
+// has to be between lastIncludedIndex and lastIndex. The caller must hold
+// rf.mu.
+func (rf *Raft) pos(index int) int {
+	return index - rf.lastIncludedIndex
+}
+
+// lastIndex returns the index of the last entry in the log, or
+// lastIncludedIndex if nothing comes after the snapshot. The caller must
+// hold rf.mu.
+func (rf *Raft) lastIndex() int {
+	return rf.lastIncludedIndex + len(rf.log) - 1
+}
+
+// termAt returns the term of the entry at index. The caller must hold rf.mu.
+func (rf *Raft) termAt(index int) int {
+	return rf.log[rf.pos(index)].Term
 }
 
 // resetElectionTimer moves the election deadline to a new random point in the

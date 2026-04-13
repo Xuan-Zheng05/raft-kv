@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"flag"
 	"fmt"
 	"math/rand/v2"
@@ -25,6 +27,12 @@ const pollEvery = 10 * time.Millisecond
 // leader has lost its job, it's enough time for a new one to be elected.
 const attemptWithin = 2 * electionTimeoutMax
 
+// snapshotEvery is how often the test application takes a snapshot, in log
+// entries. It's small so that any test with more than a handful of commands
+// compacts its logs, and a follower that misses a few dozen entries has to be
+// sent a snapshot.
+const snapshotEvery = 10
+
 // cluster is a group of Raft servers talking over a simulated network, all
 // inside one test process.
 type cluster struct {
@@ -45,6 +53,7 @@ type cluster struct {
 	mu          sync.Mutex
 	life        []int         // counts each server's restarts, so collect can ignore a dead instance
 	appliedUpTo []int         // the last index each server's current instance has applied
+	snapshots   []int         // how many snapshots each server has been handed on its apply channel
 	committed   map[int]any   // the command at each index, as applied by whichever server got there first
 	applyErr    error         // the first time a server applied something it shouldn't have
 	stop        chan struct{} // closed when the test ends, so the collect goroutines exit
@@ -68,6 +77,7 @@ func newCluster(t *testing.T, n int) *cluster {
 		plan:        rand.New(rand.NewPCG(seed, 0)),
 		life:        make([]int, n),
 		appliedUpTo: make([]int, n),
+		snapshots:   make([]int, n),
 		committed:   make(map[int]any),
 		stop:        make(chan struct{}),
 	}
@@ -118,7 +128,7 @@ func (c *cluster) start(i int) {
 	c.rafts[i] = Make(ep, i, len(c.rafts), storage, applyCh)
 	ep.Serve(c.rafts[i])
 	c.alive[i] = true
-	go c.collect(i, life, applyCh)
+	go c.collect(i, life, c.rafts[i], applyCh)
 }
 
 // crash kills server i. Both halves matter: the network stops delivering to
@@ -130,37 +140,82 @@ func (c *cluster) crash(i int) {
 	c.alive[i] = false
 }
 
-// collect records everything one instance of server i applies, and checks
-// it on the way in. Each server has to apply indexes in order with no gaps,
-// and no two servers may ever apply different commands at the same index.
-// Once server i restarts, this instance is dead and collect stops listening.
-func (c *cluster) collect(i, life int, applyCh <-chan ApplyMsg) {
+// collect plays the application for one instance of server i. It applies
+// what Raft hands it, checks everything on the way in, and takes a snapshot
+// every snapshotEvery entries. Each server has to apply indexes in order with
+// no gaps, and no two servers may ever apply different commands at the same
+// index. Once server i restarts, this instance is dead and collect stops.
+func (c *cluster) collect(i, life int, rf *Raft, applyCh <-chan ApplyMsg) {
+	var applied []any // what this instance has applied; applied[k] is the command at index k+1
 	for {
+		var msg ApplyMsg
 		select {
 		case <-c.stop:
 			return
-		case msg := <-applyCh:
-			c.mu.Lock()
-			if c.life[i] != life {
-				c.mu.Unlock()
-				return
-			}
-			if c.applyErr == nil {
-				want := c.appliedUpTo[i] + 1
-				prev, seen := c.committed[msg.Index]
-				switch {
-				case msg.Index != want:
-					c.applyErr = fmt.Errorf("server %d applied index %d, but the next one should have been %d", i, msg.Index, want)
-				case seen && prev != msg.Command:
-					c.applyErr = fmt.Errorf("server %d applied %v at index %d, but another server applied %v there", i, msg.Command, msg.Index, prev)
-				default:
-					c.appliedUpTo[i] = msg.Index
-					c.committed[msg.Index] = msg.Command
-				}
-			}
+		case msg = <-applyCh:
+		}
+
+		c.mu.Lock()
+		if c.life[i] != life {
 			c.mu.Unlock()
+			return
+		}
+		if c.applyErr != nil {
+			c.mu.Unlock()
+			continue
+		}
+		if msg.IsSnapshot {
+			applied, c.applyErr = c.checkSnapshot(i, msg)
+		} else {
+			c.applyErr = c.checkCommand(i, msg)
+			applied = append(applied, msg.Command)
+		}
+		snapshotNow := c.applyErr == nil && !msg.IsSnapshot && msg.Index%snapshotEvery == 0
+		c.mu.Unlock()
+
+		// Raft takes its own lock in Snapshot, so ours is let go first.
+		if snapshotNow {
+			rf.Snapshot(msg.Index, gobEncode(applied))
 		}
 	}
+}
+
+// checkCommand records a command server i applied, or says what's wrong
+// with it. Call it with c.mu held.
+func (c *cluster) checkCommand(i int, msg ApplyMsg) error {
+	if want := c.appliedUpTo[i] + 1; msg.Index != want {
+		return fmt.Errorf("server %d applied index %d, but the next one should have been %d", i, msg.Index, want)
+	}
+	if prev, seen := c.committed[msg.Index]; seen && prev != msg.Command {
+		return fmt.Errorf("server %d applied %v at index %d, but another server applied %v there", i, msg.Command, msg.Index, prev)
+	}
+	c.appliedUpTo[i] = msg.Index
+	c.committed[msg.Index] = msg.Command
+	return nil
+}
+
+// checkSnapshot records a snapshot server i was handed, or says what's
+// wrong with it, and returns the commands it holds. A snapshot has to move
+// the server forward, and every command in it has to match what was
+// committed at its index. Call it with c.mu held.
+func (c *cluster) checkSnapshot(i int, msg ApplyMsg) ([]any, error) {
+	if msg.Index <= c.appliedUpTo[i] {
+		return nil, fmt.Errorf("server %d was handed a snapshot up to index %d, but it had already applied up to %d", i, msg.Index, c.appliedUpTo[i])
+	}
+	var applied []any
+	gobDecode(msg.Snapshot, &applied)
+	if len(applied) != msg.Index {
+		return nil, fmt.Errorf("server %d was handed a snapshot up to index %d that holds %d commands", i, msg.Index, len(applied))
+	}
+	for k, cmd := range applied {
+		if prev, seen := c.committed[k+1]; seen && prev != cmd {
+			return nil, fmt.Errorf("server %d was handed a snapshot with %v at index %d, but another server applied %v there", i, cmd, k+1, prev)
+		}
+		c.committed[k+1] = cmd
+	}
+	c.appliedUpTo[i] = msg.Index
+	c.snapshots[i]++
+	return applied, nil
 }
 
 // appliedAt reports how many servers have applied index, and which command
@@ -180,23 +235,16 @@ func (c *cluster) appliedAt(index int) (count int, cmd any) {
 	return count, c.committed[index]
 }
 
-// one submits cmd and waits until at least want servers have applied it, and
-// returns the index it landed at. It gives cmd to the leader with the highest
-// term, since a leader cut off from the others may still think it's in
-// charge. If cmd doesn't get applied in time, say because that leader lost
-// its job first, one submits it again.
+// one submits cmd to the current leader and waits until at least want
+// servers have applied it, and returns the index it landed at. If cmd doesn't
+// get applied in time, say because that leader lost its job first, one
+// submits it again.
 func (c *cluster) one(cmd any, want int) int {
 	c.t.Helper()
 	within := reelectionWithin + attemptWithin // time for a new leader to take over, then one full attempt
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
-		leader, best := -1, -1
-		ids, terms := c.leaders()
-		for k, id := range ids {
-			if terms[k] > best {
-				leader, best = id, terms[k]
-			}
-		}
+		leader := c.leader()
 		if leader < 0 {
 			time.Sleep(pollEvery)
 			continue
@@ -231,6 +279,21 @@ func others(n int, except ...int) []int {
 		}
 	}
 	return ids
+}
+
+// leader returns the live server that thinks it's the leader with the
+// highest term, or -1 if there's none. A leader cut off from the others may
+// still think it's in charge, but its term will be lower.
+func (c *cluster) leader() int {
+	c.t.Helper()
+	leader, best := -1, -1
+	ids, terms := c.leaders()
+	for k, id := range ids {
+		if terms[k] > best {
+			leader, best = id, terms[k]
+		}
+	}
+	return leader
 }
 
 // leaders returns the live servers that think they're the leader right now,
@@ -290,4 +353,21 @@ func (c *cluster) waitForStableLeader(within time.Duration) (id, term int) {
 		}
 	}
 	return id, term
+}
+
+// gobEncode and gobDecode turn the test application's state into snapshot
+// bytes and back. They panic on failure, since that would be a bug in the
+// test itself.
+func gobEncode(v any) []byte {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(v); err != nil {
+		panic(fmt.Sprintf("can't encode %T: %v", v, err))
+	}
+	return buf.Bytes()
+}
+
+func gobDecode(data []byte, v any) {
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(v); err != nil {
+		panic(fmt.Sprintf("can't decode into %T: %v", v, err))
+	}
 }
