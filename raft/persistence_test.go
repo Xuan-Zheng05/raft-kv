@@ -165,7 +165,7 @@ func TestAgreeThroughRandomFailures(t *testing.T) {
 						cmd++
 					}
 				}
-				time.Sleep(time.Duration(c.plan.Int64N(int64(2 * electionTimeoutMax))))
+				time.Sleep(time.Duration(c.plan.Int64N(int64(2 * ElectionTimeoutMax))))
 			}
 
 			for i := range n {

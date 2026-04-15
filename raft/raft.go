@@ -18,9 +18,13 @@ import (
 // Election timeouts are picked at random from this range, as Section 5.2 of
 // the paper suggests. The randomness is what keeps servers from all timing
 // out at once and splitting the vote over and over.
+//
+// ElectionTimeoutMax is exported because code built on Raft can use it as a
+// yardstick: a leader that hasn't made progress for that long has most likely
+// been replaced, since its followers would have started an election by then.
 const (
 	electionTimeoutMin = 150 * time.Millisecond
-	electionTimeoutMax = 300 * time.Millisecond
+	ElectionTimeoutMax = 300 * time.Millisecond
 )
 
 // heartbeatInterval is how often a leader sends AppendEntries to each
@@ -758,6 +762,6 @@ func (rf *Raft) termAt(index int) int {
 // resetElectionTimer moves the election deadline to a new random point in the
 // future. The caller must hold rf.mu.
 func (rf *Raft) resetElectionTimer() {
-	timeout := electionTimeoutMin + rand.N(electionTimeoutMax-electionTimeoutMin+1)
+	timeout := electionTimeoutMin + rand.N(ElectionTimeoutMax-electionTimeoutMin+1)
 	rf.electionDeadline = time.Now().Add(timeout)
 }

@@ -25,7 +25,7 @@ const pollEvery = 10 * time.Millisecond
 // before submitting it again. Twice the longest election timeout is plenty
 // for a live leader to get a command through a few lost messages, and if the
 // leader has lost its job, it's enough time for a new one to be elected.
-const attemptWithin = 2 * electionTimeoutMax
+const attemptWithin = 2 * ElectionTimeoutMax
 
 // snapshotEvery is how often the test application takes a snapshot, in log
 // entries. It's small so that any test with more than a handful of commands
@@ -343,7 +343,7 @@ func (c *cluster) waitForLeader(within time.Duration) (id, term int) {
 func (c *cluster) waitForStableLeader(within time.Duration) (id, term int) {
 	c.t.Helper()
 	id, term = c.waitForLeader(within)
-	time.Sleep(2 * electionTimeoutMax)
+	time.Sleep(2 * ElectionTimeoutMax)
 	for i, rf := range c.rafts {
 		if !c.alive[i] {
 			continue
