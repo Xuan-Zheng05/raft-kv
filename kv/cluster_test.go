@@ -27,7 +27,9 @@ type cluster struct {
 	storage []*raft.MemStorage // what each server has saved; outlives the server itself
 	alive   []bool
 	ids     []int // the servers' network ids, which is what clients need
-	clients int   // how many clients have connected; their network ids come after the servers'
+	// clientIDs are the clients' network ids, which come after the servers'.
+	// A partition has to list them too, or they're cut off from everyone.
+	clientIDs []int
 	// plan is where randomized tests get their choices. It's seeded like the
 	// network, so rerunning with -seed replays the same plan.
 	plan *rand.Rand
@@ -92,8 +94,9 @@ func (c *cluster) crash(i int) {
 // client connects a new client. Each one handles one request at a time, so a
 // test that wants several requests in flight uses several clients.
 func (c *cluster) client() *client.Clerk {
-	c.clients++
-	return client.MakeClerk(c.net.Connect(len(c.servers)+c.clients), c.ids)
+	id := len(c.servers) + len(c.clientIDs)
+	c.clientIDs = append(c.clientIDs, id)
+	return client.MakeClerk(c.net.Connect(id), c.ids)
 }
 
 // leader returns the live server that thinks it's the leader with the

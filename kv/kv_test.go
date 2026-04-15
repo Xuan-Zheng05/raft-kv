@@ -31,8 +31,9 @@ func TestPutGetAppend(t *testing.T) {
 
 // Several clients keep reading and writing while the leader keeps getting
 // cut off from everyone else, so requests are constantly in flight when
-// leadership changes. Each client is the only writer of its own key, so it
-// always knows exactly what a Get should return.
+// leadership changes. The clients stay on the majority's side, so they can
+// keep going while the old leader is cut off. Each client is the only writer
+// of its own key, so it always knows exactly what a Get should return.
 func TestAcrossLeaderChanges(t *testing.T) {
 	t.Parallel()
 	const n = 5
@@ -68,7 +69,7 @@ func TestAcrossLeaderChanges(t *testing.T) {
 		// Cut the leader off for up to two election timeouts, long enough for
 		// the others to elect someone new, then let it back in.
 		if leader := c.leader(); leader >= 0 {
-			c.net.Partition([]int{leader}, others(n, leader))
+			c.net.Partition([]int{leader}, append(others(n, leader), c.clientIDs...))
 		}
 		time.Sleep(time.Duration(c.plan.Int64N(int64(2 * raft.ElectionTimeoutMax))))
 		c.net.Heal()
