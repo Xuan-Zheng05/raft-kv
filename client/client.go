@@ -15,13 +15,15 @@ import (
 // Clerk per goroutine instead.
 type Clerk struct {
 	net     raft.Transport
-	servers []int // the servers' ids on the network
-	leader  int   // where in servers we think the leader is
+	servers []int // servers[i] is Raft server i's id on the network
+	leader  int   // which server we think the leader is
 	id      int64 // picked at random, so two clients won't share one
 	seq     int64 // the Seq of the last request we started
 }
 
 // MakeClerk returns a Clerk that reaches the servers through net.
+// servers[i] has to be the network id of Raft server i, since that's how
+// servers name the leader when they point a client to it.
 func MakeClerk(net raft.Transport, servers []int) *Clerk {
 	return &Clerk{net: net, servers: servers, id: rand.Int64()}
 }
@@ -56,6 +58,13 @@ func (ck *Clerk) do(op kv.Op) string {
 		cancel()
 		if err == nil && reply.Err == kv.OK {
 			return reply.Value
+		}
+		// A server that isn't the leader usually knows who is. Going straight
+		// there saves trying servers we may not be able to reach, each of
+		// which costs a full timeout.
+		if err == nil && reply.Err == kv.ErrWrongLeader && reply.Leader >= 0 && reply.Leader != ck.leader {
+			ck.leader = reply.Leader
+			continue
 		}
 		ck.leader = (ck.leader + 1) % len(ck.servers)
 	}

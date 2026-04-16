@@ -37,6 +37,10 @@ const heartbeatInterval = electionTimeoutMin / 5
 // term yet.
 const noVote = -1
 
+// noLeader is what leaderID holds when this server doesn't know who the
+// leader of its current term is.
+const noLeader = -1
+
 // Transport is everything Raft needs from the network: send a request to
 // another server and wait for its reply. The simulated network's Endpoint is
 // one; anything with this Call method works.
@@ -106,7 +110,11 @@ type Raft struct {
 	matchIndex []int // for each server, the highest log index known to be stored there
 
 	// The rest is our own bookkeeping, not from the paper.
-	role             role
+	role role
+	// leaderID is who we last heard from as leader of currentTerm, or
+	// noLeader. Raft itself doesn't need it; it's there so a server that
+	// isn't the leader can point clients to the one that is (Section 8).
+	leaderID         int
 	electionDeadline time.Time     // if nothing pushes this back first, we start an election
 	applyKick        chan struct{} // wakes the applier when there's more to apply; holds at most one nudge
 
@@ -136,6 +144,7 @@ type RequestVoteReply struct {
 // lines up with the leader's there. With no entries, it's a heartbeat.
 type AppendEntriesArgs struct {
 	Term         int
+	LeaderID     int
 	PrevLogIndex int // the index of the entry just before Entries
 	PrevLogTerm  int // the term of that entry
 	Entries      []LogEntry
@@ -154,6 +163,7 @@ type AppendEntriesReply struct {
 // snapshot, and the index and term of the last entry it covers.
 type InstallSnapshotArgs struct {
 	Term              int
+	LeaderID          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	Data              []byte
@@ -193,6 +203,7 @@ func Make(peers Transport, me, n int, storage Storage, applyCh chan<- ApplyMsg) 
 		n:          n,
 		applyCh:    applyCh,
 		votedFor:   noVote,
+		leaderID:   noLeader,
 		log:        []LogEntry{{Term: 0}},
 		nextIndex:  make([]int, n),
 		matchIndex: make([]int, n),
@@ -268,6 +279,15 @@ func (rf *Raft) State() (term int, isLeader bool) {
 	return rf.currentTerm, rf.role == leader
 }
 
+// Leader returns the id of the server this one last heard from as the leader
+// of its current term, which may be itself, or -1 if it doesn't know. It's a
+// hint for clients, not a promise: that server may have lost its job since.
+func (rf *Raft) Leader() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.leaderID
+}
+
 // Kill stops the server for good: all its goroutines stop and any RPC it's
 // waiting on is abandoned. Restarting a server means calling Make again.
 func (rf *Raft) Kill() {
@@ -308,6 +328,7 @@ func (rf *Raft) startElection() {
 	rf.role = candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.leaderID = noLeader
 	rf.persist() // before any vote request goes out
 	rf.resetElectionTimer()
 
@@ -346,6 +367,7 @@ func (rf *Raft) startElection() {
 			votes++
 			if votes == rf.n/2+1 { // == rather than >=, so this happens exactly once
 				rf.role = leader
+				rf.leaderID = rf.me
 				// Start out assuming every follower's log matches ours. When
 				// that's wrong, the follower turns down our AppendEntries and
 				// we step back until we find where the logs agree.
@@ -380,6 +402,7 @@ func (rf *Raft) replicate(term int) {
 			if prev < rf.lastIncludedIndex {
 				args := &InstallSnapshotArgs{
 					Term:              term,
+					LeaderID:          rf.me,
 					LastIncludedIndex: rf.lastIncludedIndex,
 					LastIncludedTerm:  rf.log[0].Term,
 					Data:              rf.snapshot,
@@ -389,6 +412,7 @@ func (rf *Raft) replicate(term int) {
 			}
 			args := &AppendEntriesArgs{
 				Term:         term,
+				LeaderID:     rf.me,
 				PrevLogIndex: prev,
 				PrevLogTerm:  rf.termAt(prev),
 				// A copy, because the network reads these after we let go of
@@ -610,6 +634,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// this term, we lost, so we go back to being a follower. We keep our vote
 	// as it is: clearing it here would let us vote twice in the same term.
 	rf.role = follower
+	rf.leaderID = args.LeaderID
 	rf.resetElectionTimer()
 
 	// Any part of the message our snapshot already covers can be skipped. A
@@ -674,6 +699,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return nil
 	}
 	rf.role = follower
+	rf.leaderID = args.LeaderID
 	rf.resetElectionTimer()
 
 	// A snapshot that doesn't reach past what we know is committed tells us
@@ -706,6 +732,7 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.currentTerm = term
 	rf.votedFor = noVote
 	rf.role = follower
+	rf.leaderID = noLeader // whoever led the old term doesn't lead this one
 	rf.persist()
 }
 

@@ -44,10 +44,13 @@ const (
 	ErrTimeout     Err = "ErrTimeout"     // the request didn't commit in time; maybe this leader has been cut off
 )
 
-// Reply is the answer to an Op. Value is only set for a Get.
+// Reply is the answer to an Op. Value is only set for a Get. With
+// ErrWrongLeader, Leader is the server this one last heard from as leader,
+// or -1 if it doesn't know, so the client can go straight there.
 type Reply struct {
-	Err   Err
-	Value string
+	Err    Err
+	Value  string
+	Leader int
 }
 
 // Ops travel through the Raft log inside a field of type any, and gob can
@@ -134,7 +137,7 @@ func (kv *Server) Do(op *Op, reply *Reply) error {
 	index, _, isLeader := kv.rf.Start(*op)
 	if !isLeader {
 		kv.mu.Unlock()
-		reply.Err = ErrWrongLeader
+		reply.Err, reply.Leader = ErrWrongLeader, kv.rf.Leader()
 		return nil
 	}
 	// Room for one, so the apply loop never has to wait on us. If an old
@@ -150,7 +153,7 @@ func (kv *Server) Do(op *Op, reply *Reply) error {
 			// Someone else's request ended up at our index, which means we
 			// lost leadership and our entry was overwritten before it
 			// committed.
-			reply.Err = ErrWrongLeader
+			reply.Err, reply.Leader = ErrWrongLeader, kv.rf.Leader()
 			return nil
 		}
 		reply.Err, reply.Value = OK, got.value
