@@ -68,16 +68,16 @@ type Server struct {
 	// lastSeq is, for each client, the Seq of the last Put or Append of
 	// theirs that's been applied. Anything at or below it is a retry.
 	lastSeq map[int64]int64
-	// waiting holds, for each log index, the request handler waiting to hear
-	// what got applied there.
-	waiting map[int]chan applied
+	// waiting holds, for each request a handler is waiting on, where to send
+	// what a Get read once the request has been applied.
+	waiting map[request]chan string
 	done    chan struct{} // closed by Kill
 }
 
-// applied is what the apply loop tells a waiting handler.
-type applied struct {
-	op    Op
-	value string // what a Get read
+// request names one client request, the same way a retry of it is named.
+type request struct {
+	clientID int64
+	seq      int64
 }
 
 // state is what a snapshot holds: the map, and what's needed to keep spotting
@@ -105,7 +105,7 @@ func StartServer(peers raft.Transport, me, n int, storage raft.Storage, snapshot
 		snapshotEvery: snapshotEvery,
 		data:          make(map[string]string),
 		lastSeq:       make(map[int64]int64),
-		waiting:       make(map[int]chan applied),
+		waiting:       make(map[request]chan string),
 		done:          make(chan struct{}),
 	}
 	kv.rf = raft.Make(peers, me, n, storage, applyCh)
@@ -131,38 +131,38 @@ func (kv *Server) Kill() {
 // doesn't know it yet, and answering from its own map could hand back a value
 // that's already been overwritten.
 func (kv *Server) Do(op *Op, reply *Reply) error {
-	// Hold the lock across Start, so the apply loop can't get to this index
-	// before we've said we're waiting for it.
+	// Say we're waiting before the op goes into the log, so the apply loop
+	// can't get to it first. Waiting on the request itself, rather than on
+	// the log index Start picks, means only our own op can answer us.
+	//
+	// The lock is only held to touch the map, never across Start. Start
+	// needs Raft's lock, which Raft holds while it saves to disk, and holding
+	// ours through that wait would make the apply loop queue behind every
+	// request that's on its way in.
+	id := request{clientID: op.ClientID, seq: op.Seq}
+	result := make(chan string, 1) // room for one, so the apply loop never waits on us
 	kv.mu.Lock()
-	index, _, isLeader := kv.rf.Start(*op)
-	if !isLeader {
+	kv.waiting[id] = result
+	kv.mu.Unlock()
+	defer func() {
+		kv.mu.Lock()
+		if kv.waiting[id] == result {
+			delete(kv.waiting, id)
+		}
 		kv.mu.Unlock()
+	}()
+
+	if _, _, isLeader := kv.rf.Start(*op); !isLeader {
 		reply.Err, reply.Leader = ErrWrongLeader, kv.rf.Leader()
 		return nil
 	}
-	// Room for one, so the apply loop never has to wait on us. If an old
-	// handler was waiting on this index, our op replaced its op in the log,
-	// so it'll time out and its client will try again.
-	result := make(chan applied, 1)
-	kv.waiting[index] = result
-	kv.mu.Unlock()
-
 	select {
-	case got := <-result:
-		if got.op.ClientID != op.ClientID || got.op.Seq != op.Seq {
-			// Someone else's request ended up at our index, which means we
-			// lost leadership and our entry was overwritten before it
-			// committed.
-			reply.Err, reply.Leader = ErrWrongLeader, kv.rf.Leader()
-			return nil
-		}
-		reply.Err, reply.Value = OK, got.value
+	case value := <-result:
+		reply.Err, reply.Value = OK, value
 	case <-time.After(raft.ElectionTimeoutMax):
-		kv.mu.Lock()
-		if kv.waiting[index] == result {
-			delete(kv.waiting, index)
-		}
-		kv.mu.Unlock()
+		// Either the op is still on its way, or it never will be applied
+		// because this server lost leadership before it committed. The
+		// client tries again either way.
 		reply.Err = ErrTimeout
 	}
 	return nil
@@ -189,9 +189,13 @@ func (kv *Server) applyLoop(applyCh <-chan raft.ApplyMsg) {
 		}
 		op := msg.Command.(Op)
 		value := kv.apply(op)
-		if result, ok := kv.waiting[msg.Index]; ok {
-			result <- applied{op: op, value: value}
-			delete(kv.waiting, msg.Index)
+		// A retry can put the same request in the log twice. Whichever copy
+		// gets applied first answers the handler, and the waiter goes away so
+		// a second copy finds nobody there.
+		id := request{clientID: op.ClientID, seq: op.Seq}
+		if result, ok := kv.waiting[id]; ok {
+			result <- value
+			delete(kv.waiting, id)
 		}
 		var snapshot []byte
 		if msg.Index%kv.snapshotEvery == 0 {
