@@ -51,6 +51,7 @@ func (s *Echo) Hold(args *Args, reply *Reply) error {
 	s.ran.Add(1)
 	s.started <- struct{}{}
 	<-s.release
+	reply.Y = args.X
 	return nil
 }
 

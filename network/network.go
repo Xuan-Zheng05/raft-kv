@@ -1,10 +1,12 @@
-// Package network fakes a network inside one process, so we can test Raft and
-// the key-value service against the kinds of failures a real network causes.
+// Package network carries calls between servers. Most of it is a simulated
+// network that lives inside one process, so we can test Raft and the
+// key-value service against the kinds of failures a real network causes. TCP
+// (in tcp.go) carries the same calls between real processes.
 //
 // Servers register handlers shaped like net/rpc handlers, and callers make
-// request/reply calls to them. The test decides how badly the network
-// behaves: it can drop messages, delay them, split servers into partitions,
-// and crash servers.
+// request/reply calls to them. On the simulated network, the test decides how
+// badly the network behaves: it can drop messages, delay them, split servers
+// into partitions, and crash servers.
 //
 // Every message, whether a request or a reply, is dropped with the configured
 // probability. If it survives, it waits a random delay. Even then it's thrown

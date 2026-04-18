@@ -288,9 +288,15 @@ func (rf *Raft) Leader() int {
 	return rf.leaderID
 }
 
-// Kill stops the server for good: all its goroutines stop and any RPC it's
-// waiting on is abandoned. Restarting a server means calling Make again.
+// Kill stops the server for good: all its goroutines stop, any RPC it's
+// waiting on is abandoned, and it never saves anything again. Restarting a
+// server means calling Make again, maybe on the same storage, so a killed
+// server writing to that storage afterwards could overwrite what the new
+// one saved. Cancelling while holding the lock rules that out: every save
+// happens under the lock and checks for it first.
 func (rf *Raft) Kill() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.cancel()
 }
 
@@ -740,8 +746,12 @@ func (rf *Raft) becomeFollower(term int) {
 // snapshot. Everything that changes one of them calls this before letting go
 // of rf.mu, which is always before the change can reach another server:
 // replies go out after a handler returns, and requests go out after the lock
-// is released. The caller must hold rf.mu.
+// is released. A killed server doesn't save; see Kill. The caller must hold
+// rf.mu.
 func (rf *Raft) persist() {
+	if rf.ctx.Err() != nil {
+		return
+	}
 	var buf bytes.Buffer
 	state := persistentState{
 		CurrentTerm:       rf.currentTerm,
