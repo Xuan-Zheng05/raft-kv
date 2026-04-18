@@ -1,6 +1,10 @@
 package raft
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Xuan-Zheng05/raft-kv/network"
+)
 
 // With one message in ten dropped, every server in a 5-server cluster still
 // applies every command, in the same order. Fifty commands keep the test
@@ -65,4 +69,33 @@ func TestStaleLeaderEntriesReplaced(t *testing.T) {
 
 	c.net.Heal()
 	c.one(5, n)
+}
+
+// A follower that turns entries down says where the leader should try next,
+// so a leader can catch it up in a round or two instead of stepping back one
+// entry per round. The server runs alone and is fed AppendEntries directly:
+// first entries from term 1 at indexes 1-3 and term 2 at indexes 4-5, then
+// two leaders whose logs don't fit it.
+func TestRejectionSaysWhereToResume(t *testing.T) {
+	t.Parallel()
+	rf := Make(network.New(1).Connect(0), 0, 3, &MemStorage{}, make(chan ApplyMsg))
+	defer rf.Kill()
+	appendEntries := func(args *AppendEntriesArgs) AppendEntriesReply {
+		var reply AppendEntriesReply
+		rf.AppendEntries(args, &reply)
+		return reply
+	}
+	entry := func(term int) LogEntry { return LogEntry{Term: term, Command: term} }
+	appendEntries(&AppendEntriesArgs{Term: 1, Entries: []LogEntry{entry(1), entry(1), entry(1)}})
+	appendEntries(&AppendEntriesArgs{Term: 2, PrevLogIndex: 3, PrevLogTerm: 1, Entries: []LogEntry{entry(2), entry(2)}})
+
+	// A leader whose entries go after index 10: this log only reaches 5.
+	if got := appendEntries(&AppendEntriesArgs{Term: 3, PrevLogIndex: 10, PrevLogTerm: 3}); got.Success || got.ConflictTerm != 0 || got.ConflictIndex != 6 {
+		t.Fatalf("log too short: got %+v, want a refusal pointing just past index 5", got)
+	}
+	// A leader with term 3 at index 5, where this log has term 2: the leader
+	// should skip back to where term 2 starts here, index 4.
+	if got := appendEntries(&AppendEntriesArgs{Term: 3, PrevLogIndex: 5, PrevLogTerm: 3}); got.Success || got.ConflictTerm != 2 || got.ConflictIndex != 4 {
+		t.Fatalf("term mismatch: got %+v, want a refusal naming term 2 starting at index 4", got)
+	}
 }

@@ -153,9 +153,19 @@ type AppendEntriesArgs struct {
 
 // AppendEntriesReply is the answer. Term lets a leader that's behind find
 // out, and Success says whether the entries were taken.
+//
+// When they weren't, because this log doesn't line up with the leader's at
+// PrevLogIndex, the rest says where to try next, so the leader can skip
+// straight there instead of stepping back one entry per round (the
+// optimization at the end of Section 5.3). ConflictTerm is the term of the
+// entry this server has at PrevLogIndex and ConflictIndex the first index it
+// holds with that term; or, if this log doesn't reach PrevLogIndex at all,
+// ConflictTerm is 0 and ConflictIndex is just past the end of this log.
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 // InstallSnapshotArgs is what a leader sends a server that's so far behind
@@ -481,13 +491,26 @@ func (rf *Raft) sendEntries(term, peer int, args *AppendEntriesArgs) {
 	}
 
 	if !reply.Success {
-		// peer's log doesn't line up with ours at PrevLogIndex, so next round
-		// we try one entry further back. Only step back if this rejection is
-		// about where we're aiming right now; a late reply to an older request
-		// shouldn't move us.
-		if rf.nextIndex[peer] == args.PrevLogIndex+1 {
-			rf.nextIndex[peer]--
+		// peer's log doesn't line up with ours at PrevLogIndex. Only move if
+		// this rejection is about where we're aiming right now; a late reply
+		// to an older request shouldn't move us.
+		if rf.nextIndex[peer] != args.PrevLogIndex+1 {
+			return
 		}
+		// If we have entries from the term peer's log disagrees in, our logs
+		// agree up to our last one of those, so resume just after it.
+		// Otherwise skip every entry peer has from that term, or, if its log
+		// is just too short, go to where it ends.
+		next := reply.ConflictIndex
+		if reply.ConflictTerm != 0 {
+			for index := rf.lastIndex(); index > rf.lastIncludedIndex && rf.termAt(index) >= reply.ConflictTerm; index-- {
+				if rf.termAt(index) == reply.ConflictTerm {
+					next = index + 1
+					break
+				}
+			}
+		}
+		rf.nextIndex[peer] = next
 		return
 	}
 
@@ -674,8 +697,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Only take the entries if we have the entry they're meant to follow.
 	// This check is what keeps every log an exact copy of the leader's, up to
-	// the point where they agree.
-	if prev > rf.lastIndex() || rf.termAt(prev) != prevTerm {
+	// the point where they agree. When they don't, tell the leader where to
+	// try next (see AppendEntriesReply).
+	if prev > rf.lastIndex() {
+		reply.ConflictIndex = rf.lastIndex() + 1
+		return nil
+	}
+	if rf.termAt(prev) != prevTerm {
+		reply.ConflictTerm = rf.termAt(prev)
+		reply.ConflictIndex = prev
+		for reply.ConflictIndex-1 > rf.lastIncludedIndex && rf.termAt(reply.ConflictIndex-1) == reply.ConflictTerm {
+			reply.ConflictIndex--
+		}
 		return nil
 	}
 
