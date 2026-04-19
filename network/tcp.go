@@ -50,9 +50,24 @@ func (t *TCP) Call(ctx context.Context, to int, method string, args, reply any) 
 		return err
 	}
 
+	// If ctx runs out before the reply is back, we drop the connection. A TCP
+	// connection can stop moving without breaking, say while it waits out a
+	// long retransmission backoff after losing packets, and the next call
+	// should start on a fresh connection instead of queueing behind whatever
+	// is stuck on this one. Any other calls still waiting on this connection
+	// fail too, and their callers retry, as they would after any lost
+	// message.
+	//
+	// net/rpc writes the request before it hands us the call, so a send stuck
+	// on such a connection would never get to the select below. Closing the
+	// connection the moment ctx runs out is what unsticks it.
+	stop := context.AfterFunc(ctx, func() { p.forget(client) })
+	defer stop()
+
 	// Decode into a fresh value and copy it into reply only if the call
-	// works out. A reply that turns up after we've given up then can't
-	// write into the caller's variable behind its back.
+	// works out. A reply that turns up after we've given up, before the
+	// connection is closed, then can't write into the caller's variable
+	// behind its back.
 	fresh := reflect.New(reflect.TypeOf(reply).Elem())
 	call := client.Go(method, args, fresh.Interface(), make(chan *rpc.Call, 1))
 	select {
@@ -65,11 +80,15 @@ func (t *TCP) Call(ctx context.Context, to int, method string, args, reply any) 
 			if !errors.As(call.Error, &handlerErr) {
 				p.forget(client)
 			}
+			if err := ctx.Err(); err != nil {
+				return err // we closed the connection because ctx ran out, and that's what ended the call
+			}
 			return call.Error
 		}
 		reflect.ValueOf(reply).Elem().Set(fresh.Elem())
 		return nil
 	case <-ctx.Done():
+		p.forget(client) // right away, so the next call can't pick this connection up before it's closed
 		return ctx.Err()
 	}
 }
