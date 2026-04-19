@@ -57,9 +57,16 @@ func (ck *Clerk) do(op kv.Op) string {
 	ck.seq++
 	op.ClientID, op.Seq = ck.id, ck.seq
 	for {
-		// A server that can't get a request committed within the longest
-		// election timeout has most likely lost its leadership.
-		ctx, cancel := context.WithTimeout(context.Background(), raft.ElectionTimeoutMax)
+		// The server gives up on a request it can't get committed within the
+		// longest election timeout, since by then it has most likely lost its
+		// leadership, and answers ErrTimeout. We wait one more election
+		// timeout on top of that for the answer to get back to us: in a
+		// cluster that can keep a leader at all, a round trip takes less than
+		// that (Section 5.6 of the paper). Giving up any sooner means giving up
+		// on a server that's slow but about to answer, and over TCP giving up
+		// also closes the connection, so under heavy load every slow request
+		// would cost a reconnect.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*raft.ElectionTimeoutMax)
 		var reply kv.Reply
 		err := ck.net.Call(ctx, ck.servers[ck.leader], "Server.Do", &op, &reply)
 		cancel()
