@@ -341,16 +341,29 @@ cell, as median / 90th percentile / worst:
 |--:|--:|--:|--:|
 | 3 | 292 / 461 / 570 ms | 360 / 672 / 876 ms | 1.1 / 2.4 / 11.1 s |
 | 5 | 288 / 399 / 541 ms | 387 / 546 / 1,048 ms | 0.9 / 2.6 / 38.9 s |
-| 7 | 297 / 464 / 604 ms | 481 / 641 / 816 ms | didn't finish (see below) |
+| 7 | 297 / 464 / 604 ms | 481 / 641 / 816 ms | 9.5 s / 1 min 51 s / 2 min 18 s |
 
 Up to 1,024 clients, writes resume in under half a second at the median, most
 of which is the followers waiting out their 150–300 ms election timeouts
 before they notice the leader is gone. At 4,096 clients, every kill sets off
 the reconnect storm from [bug 3](#3-a-failover-that-never-recovered): the
 cluster recovers, but how long it takes depends on how hard the storm hits
-this one machine. With 7 servers at 4,096 clients, the run of 40 kills hadn't
-finished after 25 minutes and was stopped; it doesn't say how many kills it
-got through, so whether it was slow or stuck isn't known.
+this one machine.
+
+With 7 servers at 4,096 clients, every one of the 40 kills recovered, but 7
+took over a minute, and the whole run took 35 minutes. (That row comes from a
+copy of `bench` that also prints each kill as it finishes; the first attempt,
+with the plain program, was stopped at 25 minutes before it could print
+anything.) The machine runs out of room for connections. Under that load
+clients time out and redial, 4,096 clients connecting to 7 servers need more
+ports than the 16,384 ephemeral ports one host has, and the accept queues of
+the busiest servers sat full. The servers' own connections to each other get
+dropped when a call times out like any other, and their redials wait in the
+same queues, so an election can't finish until the jam clears. Sampled during
+a 2-minute failover: the kernel was using 90% of a core, three of the six
+live servers' accept queues were at or near their limit of 128, and the Raft
+goroutines were waiting on dials, while the servers themselves used about 6%
+of a core.
 
 ## Bugs the benchmarks found
 
@@ -432,8 +445,13 @@ of failures, were each tried first; neither stopped the stall.)
   was out of scope.
 - **Overload isn't handled gracefully.** At 4,096 clients throughput swings
   from run to run (3,619 to 16,776 requests/s at 5 servers), 7 servers manage
-  about 2,500, and a run of 40 leader kills at 7 servers didn't finish in 25
-  minutes. The cause isn't pinned down.
+  about 2,500, and failovers there take up to minutes. At 7 servers the cause
+  is measured: clients and servers redialing after timeouts need more
+  connections than one host can hold, and Raft's connections between servers
+  queue for the same ports and accept queues as the clients'. The 5-server
+  swings are likely the same thing, but that wasn't checked. Giving Raft
+  traffic its own port, as etcd does, would take the servers out of the
+  clients' accept queues, though not out of the shared pool of ports.
 - **Clients take a while to give up on a cut-off server.** A client waits up
   to 600 ms for an answer, twice the server's own wait, so that a slow but
   healthy server isn't mistaken for a dead one; with an equal wait, every slow
