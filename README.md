@@ -12,13 +12,13 @@ Two kinds of evidence back that up:
 - **Correctness.** 300 randomized runs of crashes, restarts, partitions, lost
   messages and reordering, with every operation clients saw checked for
   linearizability by [Porcupine](https://github.com/anishathalye/porcupine):
-  **0 violations across 12,898 operations**.
+  **0 violations across 9,042 operations**.
 - **Performance**, measured with real server processes talking over TCP and
-  syncing every write to disk: on a 5-server cluster, **5,026 requests/s at a
-  45 ms median latency** with 256 clients, and when the leader is killed,
-  writes resume after a **median of 297 ms** (40 kills). The full curve, other
-  cluster sizes and the limits of measuring on one laptop are
-  [below](#benchmarks).
+  syncing every write to disk: on a 5-server cluster, **12,498 requests/s at a
+  77 ms median latency** with 1,024 clients (4,979 at 44 ms with 256), and
+  when the leader is killed, writes resume after a **median of 387 ms** (40
+  kills). The full curve, other cluster sizes and the limits of measuring on
+  one laptop are [below](#benchmarks).
 
 ## What it guarantees
 
@@ -105,8 +105,10 @@ Section 7. The parts worth knowing about:
   number) before handing the op to Raft, and waits up to 300 ms for that exact
   request to be applied. It answers `ErrWrongLeader` with a hint about who the
   leader is, or `ErrTimeout`.
-- The client follows the hint if there is one, or tries the next server, and
-  keeps retrying until the request goes through.
+- The client waits up to 600 ms for an answer: the server's own 300 ms, plus
+  time for the answer to come back. It follows the leader hint if there is
+  one, or tries the next server, and keeps retrying until the request goes
+  through.
 
 ### Network (`network/`)
 
@@ -175,12 +177,12 @@ at one instant. The normal suite runs it 3 times; to run more:
 go test -race -run TestChaos ./kv/ -runs=300
 ```
 
-**Result: 300 of 300 runs linearizable, 12,898 operations checked** (14 to
-90 per run; most of each run is spent with the cluster split or recovering,
+**Result: 300 of 300 runs linearizable, 9,042 operations checked** (5 to 71
+per run; most of each run is spent with the cluster split or recovering,
 which is the point). Produced by
 `go test -race -p 1 -cpu 5 -timeout 30m -run TestChaos -v ./kv/ -runs=300`
 on the machine described under [Benchmarks](#benchmarks), limited to 5 cores,
-in 145 s.
+in 151 s.
 
 ### Mutation testing
 
@@ -230,82 +232,100 @@ Go 1.27.2. Each server process runs with `GOMAXPROCS=1`, so its Go code uses
 one core; the client driver uses the rest. 1,000 keys, 100-byte values, a
 snapshot every 1,000 entries. Throughput is the median of three 10-second
 runs; latency comes from the run with the median throughput. This is a laptop
-with other apps open (41% of memory free at the start), not a quiet benchmark
+with other apps open (43% of memory free at the start), not a quiet benchmark
 machine.
 
 ### Throughput and latency vs. number of clients (5 servers)
 
 | Clients | Requests/s | Put median | Put p99 |
 |--:|--:|--:|--:|
-| 1 | 25 | 40 ms | 51 ms |
-| 2 | 49 | 41 ms | 51 ms |
-| 4 | 98 | 41 ms | 50 ms |
-| 8 | 195 | 41 ms | 51 ms |
-| 16 | 384 | 41 ms | 63 ms |
-| 32 | 757 | 41 ms | 70 ms |
-| 64 | 1,464 | 42 ms | 78 ms |
-| 128 | 2,803 | 42 ms | 84 ms |
-| 256 | 5,026 | 45 ms | 92 ms |
-| 512 | 7,800 | 66 ms | 100 ms |
-| 1,024 | 12,251 | 78 ms | 135 ms |
-| 2,048 | 13,900 | 147 ms | 212 ms |
-| 4,096 | 14,071 | 230 ms | 1,557 ms |
+| 1 | 25 | 40 ms | 49 ms |
+| 2 | 49 | 41 ms | 52 ms |
+| 4 | 100 | 40 ms | 49 ms |
+| 8 | 198 | 40 ms | 50 ms |
+| 16 | 390 | 40 ms | 63 ms |
+| 32 | 770 | 40 ms | 66 ms |
+| 64 | 1,483 | 41 ms | 76 ms |
+| 128 | 2,844 | 41 ms | 86 ms |
+| 256 | 4,979 | 44 ms | 99 ms |
+| 512 | 7,926 | 64 ms | 101 ms |
+| 1,024 | 12,498 | 77 ms | 142 ms |
+| 2,048 | 14,307 | 138 ms | 206 ms |
+| 4,096 | 11,294 | 254 ms | 1,198 ms |
+
+At 4,096 clients the three runs gave 15,798, 11,294 and 3,619 requests/s;
+more on that below.
 
 ```mermaid
 xychart-beta
     title "Requests per second, 5 servers"
     x-axis "Clients" [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
     y-axis "Requests/s" 0 --> 16000
-    line [25, 49, 98, 195, 384, 757, 1464, 2803, 5026, 7800, 12251, 13900, 14071]
+    line [25, 49, 100, 198, 390, 770, 1483, 2844, 4979, 7926, 12498, 14307, 11294]
 ```
 
 ```mermaid
 xychart-beta
     title "Median Put latency (ms), 5 servers"
     x-axis "Clients" [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
-    y-axis "Milliseconds" 0 --> 250
-    line [40, 41, 41, 41, 41, 41, 42, 42, 45, 66, 78, 147, 230]
+    y-axis "Milliseconds" 0 --> 270
+    line [40, 41, 40, 40, 40, 40, 41, 41, 44, 64, 77, 138, 254]
 ```
 
 Reading the curve:
 
-- **The 40 ms floor** at one client is the cost of a commit: waiting for the
-  next replication round (up to 30 ms), the leader's disk sync, then a
-  follower's disk sync before a majority has the entry (about 9 ms each).
-  `Get`s cost the same as `Put`s because they go through the log too.
+- **The 40 ms floor** at one client is the cost of a commit: a request waits
+  for the next replication round (rounds go out every 30 ms), then for the
+  disk syncs on the leader and on the followers. `Get`s cost the same as
+  `Put`s because they go through the log too.
 - **Up to 256 clients, throughput doubles with the clients and latency barely
   moves**, because a replication round carries everything that arrived since
   the last one with one disk sync, however many requests that is.
-- **Past 256 clients, latency starts to climb** and throughput grows more
-  slowly, leveling off around 14,000 requests/s. The servers aren't short
-  of CPU: sampled with `top` in the middle of a run, the busiest server
-  process, which is the leader since it does the most work, used about 11% of
-  its one core at 256 clients and 26% at 4,096, and the others less. What
-  all five servers do share on one laptop is a single SSD, which takes every
-  one of their disk syncs, and the kernel's loopback networking. These
-  measurements don't separate which of the two sets the ceiling.
-- **The top of the curve measures this machine as much as the store.** With
-  4,096 clients on one host, the kernel's loopback networking becomes a
-  bottleneck in its own right: an unrelated 1-byte TCP echo running alongside
-  went from about 62 µs to a 2 ms median, with spikes to 190 ms, during
-  healthy runs at that load. 4,096 is also as far as this harness can go: 4,096
-  clients each connecting to 5 servers would need more than the 16,384
-  ephemeral ports one host has.
+- **Past 256 clients, the disk is the limit.** Each server saves about 26
+  times a second, once per replication round plus snapshots, and every save
+  rewrites the whole log and snapshot (180 KB at 256 clients, up to 480 KB
+  at 4,096). With all five servers syncing to the one SSD in this laptop, a
+  save that takes 9 ms on its own takes 20–25 ms, and most servers spend half
+  to three quarters of every second inside one. The same code with the disk
+  syncs taken out (still writing and renaming the files, just not waiting
+  for the disk) does far more:
+
+  | Clients | With disk syncs (one timed run) | Without (median of three) |
+  |--:|--:|--:|
+  | 256 | 5,160 req/s, 43 ms median | 8,013 req/s, 32 ms |
+  | 1,024 | 11,948 req/s, 79 ms | 32,156 req/s, 32 ms |
+  | 4,096 | 16,160 req/s, 237 ms | 55,164 req/s, 67 ms |
+
+  The CPU isn't the limit: sampled with `top` in the middle of a run, the
+  busiest server process (the leader, which does the most work) used about
+  11% of its one core at 256 clients and 26% at 4,096. Neither is the
+  network: an unrelated 1-byte TCP echo over loopback, run alongside, had a
+  median round trip of 75–81 µs at every load (101 µs with nothing running),
+  and a p99 of 364 µs at 1,024 clients and 4.3 ms at 4,096.
+- **At 4,096 clients the cluster is unstable.** One of the three runs above
+  managed only 3,619 requests/s, with a p99 of 2.6 s, and 7 servers at that
+  load manage about 2,500 (see the next table). Why isn't pinned down; the
+  disk running near its limit is the obvious suspect. 4,096 is also as far as
+  this harness can go: 4,096 clients each connecting to 5 servers would need
+  more than the 16,384 ephemeral ports one host has.
 
 ### Cluster size
 
-| Servers | 256 clients | Put median / p99 | 4,096 clients | Put median / p99 |
-|--:|--:|--:|--:|--:|
-| 3 | 5,721 req/s | 42 / 74 ms | 26,007 req/s | 152 / 238 ms |
-| 5 | 4,947 req/s | 45 / 93 ms | 14,089 req/s | 239 / 1,364 ms |
-| 7 | 3,361 req/s | 73 / 138 ms | 649 req/s (runs: 6,638, 649, 383) | 234 / 671 ms |
+Requests per second, with median and p99 Put latency:
+
+| Servers | 256 clients | 1,024 clients | 4,096 clients |
+|--:|--:|--:|--:|
+| 3 | 6,171 (41 / 80 ms) | 15,006 (72 / 96 ms) | 25,587 (153 / 264 ms) |
+| 5 | 4,800 (46 / 97 ms) | 11,679 (82 / 144 ms) | 16,776 (234 / 568 ms) |
+| 7 | 3,415 (73 / 140 ms) | 8,612 (115 / 192 ms) | 2,479 (269 / 2,088 ms) |
 
 These are separate runs from the sweep above, so the 5-server rows differ
-from it by up to 2%.
+from it: by 4% at 256 clients and 7% at 1,024, and by much more at 4,096,
+where runs vary widely.
 
-More servers mean more copies to send and more followers to hear back from,
-so throughput drops as the cluster grows, in exchange for surviving more
-failures (1 of 3, 2 of 5, 3 of 7).
+More servers mean more copies to send, more followers to hear back from and
+more processes syncing to the same disk, so throughput drops as the cluster
+grows, in exchange for surviving more failures (1 of 3, 2 of 5, 3 of 7).
 
 ### Failover
 
@@ -315,22 +335,22 @@ through. That includes the client giving up on the dead server, not just the
 election.
 
 Time until writes go through again after the leader is killed, 40 kills per
-row:
+cell, as median / 90th percentile / worst:
 
-| Servers | 256 clients: median | 90th pct | worst | 4,096 clients: median | 90th pct | worst |
-|--:|--:|--:|--:|--:|--:|--:|
-| 3 | 311 ms | 565 ms | 810 ms | 1.0 s | 3.2 s | 9.2 s |
-| 5 | 297 ms | 478 ms | 540 ms | 1.0 s | 3.5 s | 21.0 s |
-| 7 | 308 ms | 410 ms | 681 ms | 8.0 s | 36.8 s | 1 min 23 s |
+| Servers | 256 clients | 1,024 clients | 4,096 clients |
+|--:|--:|--:|--:|
+| 3 | 292 / 461 / 570 ms | 360 / 672 / 876 ms | 1.1 / 2.4 / 11.1 s |
+| 5 | 288 / 399 / 541 ms | 387 / 546 / 1,048 ms | 0.9 / 2.6 / 38.9 s |
+| 7 | 297 / 464 / 604 ms | 481 / 641 / 816 ms | didn't finish (see below) |
 
-At 256 clients, writes resume about 300 ms after the kill, most of which is
-the followers waiting out their 150–300 ms election timeouts before they
-notice the leader is gone. At 4,096 clients, every kill sets off the
-reconnect storm from [bug 3](#3-a-failover-that-never-recovered). The cluster
-always recovers now (two more runs of 40 kills at 5 servers gave medians of
-1.4 s and 1.0 s, worsts of 22.9 s and 17.8 s), but how long it takes depends
-on how hard the storm hits this one machine. Seven servers with 4,096 clients
-is more than this laptop can run at all, as the throughput table shows.
+Up to 1,024 clients, writes resume in under half a second at the median, most
+of which is the followers waiting out their 150–300 ms election timeouts
+before they notice the leader is gone. At 4,096 clients, every kill sets off
+the reconnect storm from [bug 3](#3-a-failover-that-never-recovered): the
+cluster recovers, but how long it takes depends on how hard the storm hits
+this one machine. With 7 servers at 4,096 clients, the run of 40 kills hadn't
+finished after 25 minutes and was stopped; it doesn't say how many kills it
+got through, so whether it was slow or stuck isn't known.
 
 ## Bugs the benchmarks found
 
@@ -400,32 +420,35 @@ The fix: when a call's deadline passes, the transport closes that connection,
 which also unblocks a send stuck on it, and the next call dials a new one.
 Before the fix, every run of the reproduction (five of them) stalled for
 good, each within its first 16 kills. After it, all 200 kills at 4,096
-clients recovered, across 3, 5 and 7 servers. (Giving the Raft traffic its
-own port, and making clients pause after a sweep of failures, were each tried
-first; neither stopped the stall.)
+clients recovered, across 3, 5 and 7 servers, measured right after the fix.
+(Giving the Raft traffic its own port, and making clients pause after a sweep
+of failures, were each tried first; neither stopped the stall.)
 
 ## Known gaps and limits
 
-- **One machine.** Every server shares one SSD, one kernel and one network
-  stack, which a real deployment wouldn't, and the numbers at the top of the
-  curve reflect that (see [Benchmarks](#benchmarks)). Deploying across
-  machines was out of scope.
-- **Under overload, clients give up as soon as the server does.** The server
-  waits 300 ms for a request to commit before answering `ErrTimeout`, and the
-  client also waits 300 ms, so once requests take that long the client gives
-  up first. Since the fix for bug 3, that also closes its connection, so
-  overload turns into reconnect churn: 7 servers at 4,096 clients fell to 649
-  requests/s. A client that waits twice as long (600 ms) was also measured:
-  5 servers at 4,096 clients went from 14,071 to 16,110 requests/s (p99 from
-  1.6 s to 0.75 s), 7 servers from 649 to 3,920, and failover at 256 clients
-  didn't change (median 293 ms, worst 576 ms).
+- **One machine.** All the servers share one SSD, one kernel and one network
+  stack, which a real deployment wouldn't. The shared SSD is what limits
+  throughput here (see [Benchmarks](#benchmarks)). Deploying across machines
+  was out of scope.
+- **Overload isn't handled gracefully.** At 4,096 clients throughput swings
+  from run to run (3,619 to 16,776 requests/s at 5 servers), 7 servers manage
+  about 2,500, and a run of 40 leader kills at 7 servers didn't finish in 25
+  minutes. The cause isn't pinned down.
+- **Clients take a while to give up on a cut-off server.** A client waits up
+  to 600 ms for an answer, twice the server's own wait, so that a slow but
+  healthy server isn't mistaken for a dead one; with an equal wait, every slow
+  request under heavy load also cost a reconnect, and 7 servers at 4,096
+  clients fell to 649 requests/s. The price is that a client stuck with a
+  server that's been cut off takes longer to move on: the chaos runs got
+  through 9,042 operations, against 12,898 with a 300 ms client.
 - **No retry backoff.** A client that can't find a leader goes straight on to
   the next server. That keeps failover short at normal load, but it's what
   turns a leader kill into a reconnect storm at 4,096 clients.
 - **Every save rewrites everything.** `FileStorage` rewrites the whole log and
-  snapshot on every save, so a save costs more the longer the log gets.
-  Snapshots every 1,000 entries keep that bounded while commits flow; when
-  commits stop, as they did in bug 3, the log and each save keep growing.
+  snapshot on every save, so the bytes written per save grow with the log
+  (180–480 KB per save in the benchmarks). Snapshots every 1,000 entries keep
+  that bounded while commits flow; when commits stop, as they did in bug 3,
+  the log and each save keep growing.
 - **Snapshots go in one message.** `InstallSnapshot` sends the whole
   snapshot at once, with no chunking. Fine for 1,000 keys of 100 bytes; not
   for a large store.
